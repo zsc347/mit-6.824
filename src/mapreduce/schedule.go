@@ -33,29 +33,31 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	var done sync.WaitGroup
 	for i := 0; i < ntasks; i++ {
-		wk, ok := <-registerChan
-		if ok == false {
-			fmt.Println("Worker chanel closed")
-			return
-		}
-
-		task := DoTaskArgs{}
-		task.JobName = jobName
-		if phase == mapPhase {
-			task.File = mapFiles[i]
-		}
-		task.Phase = phase
-		task.NumOtherPhase = nOther
-		task.TaskNumber = i
-
 		done.Add(1)
 		go func(i int) {
-			ok = call(wk, "Worker.DoTask", task, new(struct{}))
-			if ok == false {
-				fmt.Printf("Worker %s: execute %s phase index %d job error", wk, phase, i)
+			args := DoTaskArgs{}
+			args.JobName = jobName
+			if phase == mapPhase {
+				args.File = mapFiles[i]
 			}
-			done.Done()
-			registerChan <- wk
+			args.Phase = phase
+			args.NumOtherPhase = nOther
+			args.TaskNumber = i
+			for {
+				wk, ok := <-registerChan
+				if ok == false {
+					done.Done()
+					panic("Worker channel closed")
+				}
+				ok = call(wk, "Worker.DoTask", args, new(struct{}))
+				if ok == true {
+					done.Done()
+					registerChan <- wk
+					break
+				} else {
+					fmt.Printf("Worker %s: execute %s phase index %d job error\n", wk, phase, i)
+				}
+			}
 		}(i)
 	}
 	done.Wait()
