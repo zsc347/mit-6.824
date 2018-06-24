@@ -69,7 +69,7 @@ func doReduce(
 			if !ok {
 				m[kv.Key] = make([]string, 0)
 			}
-			_ = append(m[kv.Key], kv.Value)
+			m[kv.Key] = append(m[kv.Key], kv.Value)
 		}
 
 	}
