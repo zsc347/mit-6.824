@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -213,8 +214,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	success := false
 	matchIndex := 0
 
+	// fmt.Printf("server %d got request: %v \n", rf.me, args)
 	if rf.currentTerm < args.Term ||
 		(rf.currentTerm == args.Term && rf.state != FOLLOWER) {
+		fmt.Printf("server %d state step down", rf.me)
 		rf.stepDown(args.Term)
 	}
 	if rf.currentTerm == args.Term {
@@ -226,14 +229,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			for i := 0; i < len(args.Entries); i++ {
 				index++
 				if logTerm(rf.log, index) != args.Entries[i].Term {
-					rf.log = rf.log[:index]
+					rf.log = rf.log[:index-1]
 					rf.log = append(rf.log, args.Entries[i])
 				}
 			}
 			matchIndex = index
-			rf.commitIndex = min(len(rf.log), max(rf.commitIndex, args.LeaderCommit))
 			rf.electionElapsed = 0
+			// rf.commitIndex = min(len(rf.log), max(rf.commitIndex, args.LeaderCommit))
+			afterCommitIndex := min(len(rf.log), max(rf.commitIndex, args.LeaderCommit))
+			rf.advanceCommitIndexTo(afterCommitIndex)
 		}
+
 	}
 	reply.Success = success
 	reply.Term = rf.currentTerm
@@ -296,9 +302,22 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == LEADER {
+		fmt.Print("leader start cmd ")
+		fmt.Println(command)
+		isLeader = true
+		entry := Entry{}
+		entry.Term = rf.currentTerm
+		entry.Command = command
+		rf.log = append(rf.log, entry)
+		index = len(rf.log)
+		term = rf.currentTerm
+	}
 
 	return index, term, isLeader
 }
@@ -340,8 +359,7 @@ func (rf *Raft) handleRequestVoteReply(peer int, reply *RequestVoteReply) {
 				rf.nextIndex[i] = nextIndex
 				rf.matchIndex[i] = 0
 			}
-
-			fmt.Printf("%d become leader for term %d \n", rf.me, rf.currentTerm)
+			// fmt.Printf("%d become leader for term %d \n", rf.me, rf.currentTerm)
 			rf.state = LEADER
 			rf.electionElapsed = 0
 		}
@@ -358,9 +376,36 @@ func (rf *Raft) handleAppendEntriesReply(peer int, reply *AppendEntriesReply) {
 	if rf.state == LEADER && rf.currentTerm == reply.Term {
 		if reply.Success {
 			rf.matchIndex[peer] = max(rf.matchIndex[peer], reply.MatchIndex)
+			rf.matchIndex[rf.me] = len(rf.log)
 			rf.nextIndex[peer] = reply.MatchIndex + 1
+
+			fmt.Printf("leader %d got %d reply %v, current match %v \n", rf.me, peer, reply, rf.matchIndex)
+			if rf.matchIndex[peer] > rf.commitIndex {
+				matchCopy := make([]int, len(rf.matchIndex))
+				copy(matchCopy, rf.matchIndex)
+				// fmt.Printf("leader %d got %d reply %v, current match %v \n", rf.me, peer, reply, matchCopy)
+				sort.Ints(matchCopy)
+				advanceIndex := matchCopy[len(rf.peers)/2]
+				if logTerm(rf.log, advanceIndex) == rf.currentTerm {
+					rf.advanceCommitIndexTo(advanceIndex)
+				}
+			}
 		} else {
 			rf.nextIndex[peer] = max(1, rf.nextIndex[peer]-1)
+		}
+	}
+}
+
+func (rf *Raft) advanceCommitIndexTo(commitIndex int) {
+	if commitIndex > rf.commitIndex {
+		fmt.Printf("server %d advance %d, %d \n", rf.me, rf.commitIndex, commitIndex)
+		for i := rf.commitIndex; i < commitIndex; i++ {
+			applyMsg := ApplyMsg{}
+			applyMsg.Command = rf.log[i].Command
+			applyMsg.CommandIndex = i + 1
+			applyMsg.CommandValid = true
+			rf.applyCh <- applyMsg
+			rf.commitIndex++
 		}
 	}
 }
@@ -398,6 +443,7 @@ func (rf *Raft) tick() {
 
 					go func(i int) {
 						reply := AppendEntriesReply{}
+						fmt.Printf("leader %d at term %d send entry to %d, %v \n", rf.me, rf.currentTerm, i, args)
 						rf.sendAppendEntries(i, &args, &reply)
 						rf.handleAppendEntriesReply(i, &reply)
 					}(i)
@@ -501,7 +547,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go func() {
 		for {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 			rf.tick()
 		}
 	}()
