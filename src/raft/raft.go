@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -93,7 +92,7 @@ const (
 
 const (
 	configElectionTimeout  int = 15
-	configHeartBeatTimeout int = 2
+	configHeartBeatTimeout int = 1
 )
 
 // return currentTerm and whether this server
@@ -173,9 +172,12 @@ type AppendEntriesReply struct {
 // must used in lock
 func (rf *Raft) stepDown(term int) {
 	rf.currentTerm = term
+	if rf.state != FOLLOWER {
+		rf.resetElectionTimeout(configElectionTimeout)
+	}
 	rf.state = FOLLOWER
 	rf.votedFor = -1
-	rf.resetElectionTimeout(configElectionTimeout)
+
 }
 
 func upToDate(term1 int, index1 int, term2 int, index2 int) bool {
@@ -217,7 +219,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// fmt.Printf("server %d got request: %v \n", rf.me, args)
 	if rf.currentTerm < args.Term ||
 		(rf.currentTerm == args.Term && rf.state != FOLLOWER) {
-		fmt.Printf("server %d state step down", rf.me)
+		// fmt.Printf("server %d state step down", rf.me)
 		rf.stepDown(args.Term)
 	}
 	if rf.currentTerm == args.Term {
@@ -226,6 +228,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				logTerm(rf.log, args.PrevLogIndex) == args.PrevLogTerm) {
 			success = true
 			var index = args.PrevLogIndex
+			if len(args.Entries) > 0 {
+				// fmt.Printf("entries %v, before %v \n", args, rf.log)
+			}
+
 			for i := 0; i < len(args.Entries); i++ {
 				index++
 				if logTerm(rf.log, index) != args.Entries[i].Term {
@@ -236,14 +242,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			matchIndex = index
 			rf.electionElapsed = 0
 			// rf.commitIndex = min(len(rf.log), max(rf.commitIndex, args.LeaderCommit))
+
+			args.LeaderCommit = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 			afterCommitIndex := min(len(rf.log), max(rf.commitIndex, args.LeaderCommit))
+			if len(args.Entries) > 0 {
+				// fmt.Printf("after %v \n", rf.log)
+				// fmt.Printf("server %d try advance to %d, logs %v \n", rf.me, afterCommitIndex, rf.log)
+			}
+
+			// fmt.Printf("server %d append entries %v \n", rf.me, args)
 			rf.advanceCommitIndexTo(afterCommitIndex)
 		}
-
+		reply.MatchIndex = matchIndex
+	} else {
+		var nextIndex int
+		if len(rf.log) < args.PrevLogIndex {
+			nextIndex = len(rf.log) + 1
+		} else {
+			unMatchTerm := logTerm(rf.log, args.PrevLogIndex)
+			for nextIndex > 0 && logTerm(rf.log, nextIndex) == unMatchTerm {
+				nextIndex--
+			}
+		}
+		reply.MatchIndex = nextIndex
 	}
 	reply.Success = success
 	reply.Term = rf.currentTerm
-	reply.MatchIndex = matchIndex
 }
 
 //
@@ -308,8 +332,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state == LEADER {
-		fmt.Print("leader start cmd ")
-		fmt.Println(command)
+		// fmt.Printf("leader %d start cmd %v at term %d\n", rf.me, command, rf.currentTerm)
 		isLeader = true
 		entry := Entry{}
 		entry.Term = rf.currentTerm
@@ -371,6 +394,7 @@ func (rf *Raft) handleAppendEntriesReply(peer int, reply *AppendEntriesReply) {
 	defer rf.mu.Unlock()
 
 	if rf.currentTerm < reply.Term {
+		// fmt.Printf("leader %d step down, curTerm %d, replyTerm %d \n", rf.me, rf.currentTerm, reply.Term)
 		rf.stepDown(reply.Term)
 	}
 	if rf.state == LEADER && rf.currentTerm == reply.Term {
@@ -379,7 +403,7 @@ func (rf *Raft) handleAppendEntriesReply(peer int, reply *AppendEntriesReply) {
 			rf.matchIndex[rf.me] = len(rf.log)
 			rf.nextIndex[peer] = reply.MatchIndex + 1
 
-			fmt.Printf("leader %d got %d reply %v, current match %v \n", rf.me, peer, reply, rf.matchIndex)
+			// fmt.Printf("leader %d got %d reply %v, current match %v \n", rf.me, peer, reply, rf.matchIndex)
 			if rf.matchIndex[peer] > rf.commitIndex {
 				matchCopy := make([]int, len(rf.matchIndex))
 				copy(matchCopy, rf.matchIndex)
@@ -391,14 +415,14 @@ func (rf *Raft) handleAppendEntriesReply(peer int, reply *AppendEntriesReply) {
 				}
 			}
 		} else {
-			rf.nextIndex[peer] = max(1, rf.nextIndex[peer]-1)
+			rf.nextIndex[peer] = max(1, reply.MatchIndex)
 		}
 	}
 }
 
 func (rf *Raft) advanceCommitIndexTo(commitIndex int) {
 	if commitIndex > rf.commitIndex {
-		fmt.Printf("server %d advance %d, %d \n", rf.me, rf.commitIndex, commitIndex)
+		// fmt.Printf("server %d advance %d, %d , state %v \n", rf.me, rf.commitIndex, commitIndex, rf.state)
 		for i := rf.commitIndex; i < commitIndex; i++ {
 			applyMsg := ApplyMsg{}
 			applyMsg.Command = rf.log[i].Command
@@ -412,6 +436,7 @@ func (rf *Raft) advanceCommitIndexTo(commitIndex int) {
 
 func (rf *Raft) resetElectionTimeout(electionTimeout int) {
 	rf.electionTimeout = electionTimeout + rand.Intn(electionTimeout)
+	// fmt.Printf("server %d reset election timeout %d \n", rf.me, rf.electionTimeout)
 }
 
 func (rf *Raft) tick() {
@@ -422,6 +447,7 @@ func (rf *Raft) tick() {
 		rf.heartbeatElapsed++
 		// send heart beat if it is leader
 		if rf.heartbeatElapsed >= rf.heartbeatTimeout {
+			// fmt.Printf("server %d, heartbeatElapsed %d, rf.heartbeatTimeout %d \n", rf.me, rf.heartbeatElapsed, rf.heartbeatTimeout)
 			rf.heartbeatElapsed = 0
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
@@ -443,7 +469,9 @@ func (rf *Raft) tick() {
 
 					go func(i int) {
 						reply := AppendEntriesReply{}
-						fmt.Printf("leader %d at term %d send entry to %d, %v \n", rf.me, rf.currentTerm, i, args)
+						if len(args.Entries) > 0 {
+							// fmt.Printf("leader %d at term %d send entry to %d, %v \n", rf.me, rf.currentTerm, i, args)
+						}
 						rf.sendAppendEntries(i, &args, &reply)
 						rf.handleAppendEntriesReply(i, &reply)
 					}(i)
@@ -453,7 +481,8 @@ func (rf *Raft) tick() {
 	} else {
 		rf.electionElapsed++
 		// send election if it is candidate or it is follower
-		if rf.electionElapsed > rf.electionTimeout {
+		if rf.electionElapsed >= rf.electionTimeout {
+			// fmt.Printf("server %d, electionElapsed %d, rf.electionTimeout %d \n", rf.me, rf.electionElapsed, rf.electionTimeout)
 			rf.electionElapsed = 0
 
 			rf.state = CANDIDATE
@@ -541,13 +570,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.heartbeatTimeout = configHeartBeatTimeout
 	rf.resetElectionTimeout(configElectionTimeout)
+	//fmt.Printf("server %d election timeout %d \n", rf.me, rf.electionTimeout)
 
 	rf.heartbeatElapsed = 0
 	rf.electionElapsed = 0
 
 	go func() {
 		for {
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(40 * time.Millisecond)
 			rf.tick()
 		}
 	}()
