@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -117,6 +119,19 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// data := w.Bytes()
+	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -128,6 +143,31 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := labgob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   rf.xxx = xxx
+	//   rf.yyy = yyy
+	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []Entry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("decode error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -177,7 +217,7 @@ func (rf *Raft) stepDown(term int) {
 	}
 	rf.state = FOLLOWER
 	rf.votedFor = -1
-
+	rf.persist()
 }
 
 func upToDate(term1 int, index1 int, term2 int, index2 int) bool {
@@ -205,6 +245,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		granted = true
 		rf.votedFor = args.CandidateID
 	}
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = granted
 }
@@ -266,6 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.MatchIndex = nextIndex
 	}
+	rf.persist()
 	reply.Success = success
 	reply.Term = rf.currentTerm
 }
@@ -340,6 +382,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, entry)
 		index = len(rf.log)
 		term = rf.currentTerm
+		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -492,6 +535,7 @@ func (rf *Raft) tick() {
 			}
 			rf.voteGranted[rf.me] = true
 			rf.votedFor = rf.me
+			rf.persist()
 
 			args := RequestVoteArgs{}
 			args.Term = rf.currentTerm
@@ -584,5 +628,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	// fmt.Printf("server %d start, %d, %d, %v \n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 	return rf
 }
