@@ -11,6 +11,9 @@ type Clerk struct {
 	nserver int
 	leader  int
 	// You will have to modify this struct.
+
+	clientID int64
+	seq      int64
 }
 
 func nrand() int64 {
@@ -22,10 +25,12 @@ func nrand() int64 {
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
+	// You'll have to add code here.
 	ck.servers = servers
 	ck.nserver = len(ck.servers)
 	ck.leader = 0
-	// You'll have to add code here.
+	ck.clientID = nrand()
+	ck.seq = 1
 	return ck
 }
 
@@ -43,10 +48,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{
-		Key: key,
+		Key:      key,
+		ClinetID: ck.clientID,
+		Seq:      ck.seq,
 	}
-	reply := GetReply{}
 
+	ck.seq++
+
+	reply := GetReply{}
 	for {
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 		DPrintf("server %d reply %v", ck.leader, &reply)
@@ -71,12 +80,16 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClinetID: ck.clientID,
+		Seq:      ck.seq,
 	}
-	reply := PutAppendReply{}
 
+	ck.seq++
+
+	reply := PutAppendReply{}
 	for {
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
 		DPrintf("server %d, cmd %v reply %v", ck.leader, &args, &reply)

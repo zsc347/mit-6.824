@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -18,9 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Op struct {
+	ClientID int64
+	Seq      int64
+
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  string // Get or put
+	Key   string
+	Value string
 }
 
 type KVServer struct {
@@ -31,15 +38,100 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
+	getReplyChan chan GetReply
+	putReplyChan chan PutAppendReply
+
 	// Your definitions here.
+	store        map[string]string
+	reponsesChan map[int]chan *ResponseMsg
+}
+
+type ResponseMsg struct {
+	ClientID    int64
+	Seq         int64
+	KeyNotExist bool
+	Value       string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Type: "GET",
+		Key:  args.Key,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+
+	// TODO
+
+	ch := make(chan *ResponseMsg, 1)
+	kv.mu.Lock()
+	kv.reponsesChan[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		if msg.ClientID == args.ClinetID && msg.Seq == args.Seq {
+			if msg.KeyNotExist {
+				reply.Err = ErrNoKey
+			} else {
+				reply.Err = OK
+			}
+			reply.WrongLeader = false
+			reply.Value = msg.Value
+		} else {
+			reply.Err = ErrApplyFailed
+			reply.WrongLeader = false
+			reply.Value = ""
+		}
+	case <-time.After(40 * time.Millisecond):
+		reply.Err = ErrTimeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.reponsesChan, index)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Type:  args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+
+	ch := make(chan *ResponseMsg, 1)
+	kv.mu.Lock()
+	kv.reponsesChan[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		if msg.ClientID == args.ClinetID && msg.Seq == args.Seq {
+			reply.Err = OK
+			reply.WrongLeader = false
+		} else {
+			reply.WrongLeader = false
+			reply.Err = ErrApplyFailed
+		}
+	case <-time.After(40 * time.Millisecond):
+		reply.Err = ErrTimeout
+	}
+
+	// TODO
+
+	kv.mu.Lock()
+	delete(kv.reponsesChan, index)
+	kv.mu.Unlock()
 }
 
 //
@@ -80,6 +172,47 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	go func() {
+		for {
+			msg := <-kv.applyCh
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+
+			op := msg.Command.(Op)
+			switch op.Type {
+			case "Put":
+				kv.store[op.Key] = op.Value
+				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
+					replyMsg := &ResponseMsg{
+						ClientID: op.ClientID,
+						Seq:      op.Seq,
+					}
+					ch <- replyMsg
+				}
+			case "Append":
+				kv.store[op.Key] = kv.store[op.Key] + op.Value
+				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
+					replyMsg := &ResponseMsg{
+						ClientID: op.ClientID,
+						Seq:      op.Seq,
+					}
+					ch <- replyMsg
+				}
+			case "Get":
+				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
+					v, ok := kv.store[op.Key]
+					replyMsg := &ResponseMsg{
+						ClientID:    op.ClientID,
+						Seq:         op.Seq,
+						KeyNotExist: !ok,
+						Value:       v,
+					}
+					ch <- replyMsg
+				}
+			}
+		}
+	}()
 
 	// You may need initialization code here.
 
