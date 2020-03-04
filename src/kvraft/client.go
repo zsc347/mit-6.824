@@ -4,13 +4,19 @@ import (
 	"crypto/rand"
 	"labrpc"
 	"math/big"
+	"time"
 )
+
+const RetryInterval = time.Duration(125 * time.Millisecond)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	nserver int
 	leader  int
 	// You will have to modify this struct.
+
+	clientID int64
+	seq      int64
 }
 
 func nrand() int64 {
@@ -22,10 +28,12 @@ func nrand() int64 {
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
+	// You'll have to add code here.
 	ck.servers = servers
 	ck.nserver = len(ck.servers)
 	ck.leader = 0
-	// You'll have to add code here.
+	ck.clientID = nrand()
+	ck.seq = 1
 	return ck
 }
 
@@ -43,18 +51,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{
-		Key: key,
+		Key:      key,
+		ClinetID: ck.clientID,
+		Seq:      ck.seq,
 	}
-	reply := GetReply{}
 
+	ck.seq++
+
+	var reply GetReply
 	for {
+		reply = GetReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
-		DPrintf("server %d reply %v", ck.leader, &reply)
-		if !ok || reply.WrongLeader || reply.Err != "" {
-			ck.leader = (ck.leader + 1) % ck.nserver
-			continue
+		DPrintf("Get client %d send request %v get response %v", ck.clientID, args, reply)
+		if ok && reply.Err == OK {
+			return reply.Value
 		}
-		return reply.Value
+		time.Sleep(RetryInterval)
+		ck.leader = (ck.leader + 1) % ck.nserver
 	}
 }
 
@@ -71,19 +84,24 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClinetID: ck.clientID,
+		Seq:      ck.seq,
 	}
-	reply := PutAppendReply{}
 
+	ck.seq++
+
+	var reply PutAppendReply
 	for {
+		reply = PutAppendReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
-		DPrintf("server %d, cmd %v reply %v", ck.leader, &args, &reply)
-		if !ok || reply.WrongLeader || reply.Err != "" {
-			ck.leader++
-			continue
+		if ok && reply.Err == OK {
+			return
 		}
+		time.Sleep(RetryInterval)
+		ck.leader = (ck.leader + 1) % ck.nserver
 	}
 
 }
