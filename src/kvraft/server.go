@@ -1,7 +1,6 @@
 package raftkv
 
 import (
-	"encoding/json"
 	"labgob"
 	"labrpc"
 	"log"
@@ -59,10 +58,11 @@ type Op struct {
 // [client a, seq 1, get x], return 1, success to append, success to reply
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu       sync.Mutex
+	me       int
+	rf       *raft.Raft
+	applyCh  chan raft.ApplyMsg
+	shutdown chan interface{}
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -89,41 +89,44 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Seq:      args.Seq,
 	}
 
-	// TODO
-	kv.mu.Lock()
-	index, _, isLeader := kv.rf.Start(op)
+	isLeader, msg, timeout := kv.start(&op)
 	if !isLeader {
 		reply.WrongLeader = true
-		kv.mu.Unlock()
+		reply.Err = ErrApplyFailed
 		return
 	}
-	ch := make(chan *ResponseMsg)
+	if timeout {
+		reply.WrongLeader = false
+		reply.Err = ErrTimeout
+		return
+	}
+
+	reply.Err = OK
+	reply.WrongLeader = false
+	reply.KeyNotExist = msg.KeyNotExist
+	reply.Value = msg.Value
+}
+
+func (kv *KVServer) start(op *Op) (bool, *ResponseMsg, bool) {
+
+	index, _, isLeader := kv.rf.Start(*op)
+	if !isLeader {
+		return false, nil, false
+	}
+	kv.mu.Lock()
+	ch := make(chan *ResponseMsg, 1)
 	kv.reponsesChan[index] = ch
 	kv.mu.Unlock()
 
 	select {
 	case msg := <-ch:
-		DPrintf("server %d channel response %v", kv.me, msg)
-		if msg.ClientID == args.ClinetID && msg.Seq == args.Seq {
-			if msg.KeyNotExist {
-				reply.Err = ErrNoKey
-			} else {
-				reply.Err = OK
-			}
-			reply.WrongLeader = false
-			reply.Value = msg.Value
-		} else {
-			reply.Err = ErrApplyFailed
-			reply.WrongLeader = false
-			reply.Value = ""
+		if msg.ClientID == op.ClientID && op.Seq == op.Seq {
+			return true, msg, false
 		}
+		return false, nil, false
 	case <-time.After(5 * time.Second):
-		reply.Err = ErrTimeout
+		return false, nil, true
 	}
-
-	kv.mu.Lock()
-	delete(kv.reponsesChan, index)
-	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -135,38 +138,19 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientID: args.ClinetID,
 		Seq:      args.Seq,
 	}
-
-	kv.mu.Lock()
-	index, _, isLeader := kv.rf.Start(op)
+	isLeader, _, timeout := kv.start(&op)
 	if !isLeader {
 		reply.WrongLeader = true
-		kv.mu.Unlock()
+		reply.Err = ErrApplyFailed
+		return
+	}
+	if timeout {
+		reply.WrongLeader = false
+		reply.Err = ErrTimeout
 		return
 	}
 
-	ch := make(chan *ResponseMsg)
-	kv.reponsesChan[index] = ch
-	kv.mu.Unlock()
-
-	select {
-	case msg := <-ch:
-		DPrintf("server %d channel response %v", kv.me, msg)
-		if msg.ClientID == args.ClinetID && msg.Seq == args.Seq {
-			reply.Err = OK
-			reply.WrongLeader = false
-		} else {
-			reply.WrongLeader = false
-			reply.Err = ErrApplyFailed
-		}
-	case <-time.After(5 * time.Second):
-		reply.Err = ErrTimeout
-		DPrintf("server %d timeout, failed to reply", kv.me)
-	}
-
-	// TODO
-	kv.mu.Lock()
-	delete(kv.reponsesChan, index)
-	kv.mu.Unlock()
+	reply.Err = OK
 }
 
 //
@@ -178,6 +162,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.shutdown)
+}
+
+func (kv *KVServer) notifyIfPresent(index int, rsp *ResponseMsg) {
+	if ch, ok := kv.reponsesChan[index]; ok {
+		delete(kv.reponsesChan, index)
+		ch <- rsp
+	}
 }
 
 //
@@ -210,66 +202,47 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clientLastSeq = make(map[int64]int64)
 	kv.reponsesChan = make(map[int]chan *ResponseMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.shutdown = make(chan interface{})
 
 	go func() {
 		for {
-			msg := <-kv.applyCh
+			select {
+			case msg := <-kv.applyCh:
+				kv.mu.Lock()
 
-			kv.mu.Lock()
+				op := msg.Command.(Op)
 
-			msgJSON, _ := json.Marshal(msg)
-			DPrintf("msg from raft apply chan %s, index %d ", msgJSON, msg.CommandIndex)
-
-			op := msg.Command.(Op)
-			switch op.Type {
-			case "Put":
-				if op.Seq > kv.clientLastSeq[op.ClientID] {
-					DPrintf("server %d execute cmd Put key %s - Value %s", kv.me, op.Key, op.Value)
+				var replyMsg *ResponseMsg
+				if op.Type == "Get" {
 					kv.clientLastSeq[op.ClientID] = op.Seq
-					kv.store[op.Key] = op.Value
-				}
-				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
-					replyMsg := &ResponseMsg{
-						ClientID: op.ClientID,
-						Seq:      op.Seq,
-					}
-					ch <- replyMsg
-				}
-			case "Append":
-				if op.Seq > kv.clientLastSeq[op.ClientID] {
-					kv.clientLastSeq[op.ClientID] = op.Seq
-					kv.store[op.Key] = kv.store[op.Key] + op.Value
-					DPrintf("server %d execute cmd Append key %s - Value %s", kv.me, op.Key, op.Value)
-				}
-				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
-					replyMsg := &ResponseMsg{
-						ClientID: op.ClientID,
-						Seq:      op.Seq,
-					}
-					ch <- replyMsg
-				}
-			case "Get":
-				if op.Seq > kv.clientLastSeq[op.ClientID] {
-					// we have already respond to the message and perform the action
-					kv.clientLastSeq[op.ClientID] = op.Seq
-				}
-
-				DPrintf("server %d execute cmd GET key %s", kv.me, op.Key)
-				if ch, ok := kv.reponsesChan[msg.CommandIndex]; ok {
 					v, ok := kv.store[op.Key]
-					replyMsg := &ResponseMsg{
+					replyMsg = &ResponseMsg{
 						ClientID:    op.ClientID,
 						Seq:         op.Seq,
 						KeyNotExist: !ok,
 						Value:       v,
 					}
-					replyMsgJSON, _ := json.Marshal(replyMsg)
-					DPrintf("Get reply to chan %s", replyMsgJSON)
-					ch <- replyMsg
+				} else {
+					if op.Seq > kv.clientLastSeq[op.ClientID] {
+						kv.clientLastSeq[op.ClientID] = op.Seq
+						if op.Type == "Put" {
+							kv.store[op.Key] = op.Value
+						} else {
+							kv.store[op.Key] += op.Value
+						}
+					}
+					replyMsg = &ResponseMsg{
+						ClientID: op.ClientID,
+						Seq:      op.Seq,
+					}
 				}
+				kv.notifyIfPresent(msg.CommandIndex, replyMsg)
+
+				kv.mu.Unlock()
+			case <-kv.shutdown:
+				return
 			}
 
-			kv.mu.Unlock()
 		}
 	}()
 

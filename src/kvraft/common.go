@@ -2,7 +2,6 @@ package raftkv
 
 const (
 	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
 	ErrTimeout     = "ErrTimeout"
 	ErrApplyFailed = "ErrApplyFailed"
 )
@@ -36,5 +35,6 @@ type GetArgs struct {
 type GetReply struct {
 	WrongLeader bool
 	Err         Err
+	KeyNotExist bool
 	Value       string
 }

@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const RetryInterval = time.Duration(125 * time.Millisecond)
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	nserver int
@@ -54,7 +56,6 @@ func (ck *Clerk) Get(key string) string {
 		Seq:      ck.seq,
 	}
 
-	
 	ck.seq++
 
 	var reply GetReply
@@ -62,12 +63,11 @@ func (ck *Clerk) Get(key string) string {
 		reply = GetReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 		DPrintf("Get client %d send request %v get response %v", ck.clientID, args, reply)
-		if !ok || reply.WrongLeader || reply.Err != OK {
-			ck.leader = (ck.leader + 1) % ck.nserver
-			time.Sleep(2 * time.Second)
-			continue
+		if ok && reply.Err == OK {
+			return reply.Value
 		}
-		return reply.Value
+		time.Sleep(RetryInterval)
+		ck.leader = (ck.leader + 1) % ck.nserver
 	}
 }
 
@@ -97,15 +97,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		reply = PutAppendReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
-
-		DPrintf("PutAppend client %d send request %v get response %v", ck.clientID, args, reply)
-		if !ok || reply.WrongLeader || reply.Err != OK {
-			ck.leader = (ck.leader + 1) % ck.nserver
-			time.Sleep(2 * time.Second)
-			continue
-		} else {
+		if ok && reply.Err == OK {
 			return
 		}
+		time.Sleep(RetryInterval)
+		ck.leader = (ck.leader + 1) % ck.nserver
 	}
 
 }
