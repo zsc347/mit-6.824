@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"labrpc"
 	"math/big"
+	"time"
 )
 
 type Clerk struct {
@@ -53,14 +54,17 @@ func (ck *Clerk) Get(key string) string {
 		Seq:      ck.seq,
 	}
 
+	
 	ck.seq++
 
-	reply := GetReply{}
+	var reply GetReply
 	for {
+		reply = GetReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
-		DPrintf("server %d reply %v", ck.leader, &reply)
-		if !ok || reply.WrongLeader || reply.Err != "" {
+		DPrintf("Get client %d send request %v get response %v", ck.clientID, args, reply)
+		if !ok || reply.WrongLeader || reply.Err != OK {
 			ck.leader = (ck.leader + 1) % ck.nserver
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		return reply.Value
@@ -89,13 +93,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	ck.seq++
 
-	reply := PutAppendReply{}
+	var reply PutAppendReply
 	for {
+		reply = PutAppendReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
-		DPrintf("server %d, cmd %v reply %v", ck.leader, &args, &reply)
-		if !ok || reply.WrongLeader || reply.Err != "" {
-			ck.leader++
+
+		DPrintf("PutAppend client %d send request %v get response %v", ck.clientID, args, reply)
+		if !ok || reply.WrongLeader || reply.Err != OK {
+			ck.leader = (ck.leader + 1) % ck.nserver
+			time.Sleep(2 * time.Second)
 			continue
+		} else {
+			return
 		}
 	}
 
