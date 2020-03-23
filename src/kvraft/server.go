@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -57,6 +58,14 @@ type Op struct {
 // [client b, seq 1, put x 1]
 // [client a, seq 1, get x], return 1, success to append, success to reply
 
+// 重放攻击+server-fail vs snapshot+last-seq
+// last seq 如何保证重放攻击在kv server非正常挂掉时还能恢复?
+// store可以通过重放恢复
+// last seq 也需要可以通过log replay恢复
+// command 中记录了last seq信息
+// snapshot中也应当记录此信息
+// last seq 信息应当只通过log play来维护或者通过log play可以完全恢复
+
 type KVServer struct {
 	mu       sync.Mutex
 	me       int
@@ -65,6 +74,7 @@ type KVServer struct {
 	shutdown chan interface{}
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	store         map[string]string
@@ -172,6 +182,28 @@ func (kv *KVServer) notifyIfPresent(index int, rsp *ResponseMsg) {
 	}
 }
 
+func (kv *KVServer) tryPersist() {
+	if kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	// kv server state
+	e.Encode(kv.store)
+	e.Encode(kv.clientLastSeq)
+
+	snapshot := w.Bytes()
+
+	// TODO
+	// raft snapshot
+	// last included index & last included term
+
+	kv.persister.SaveStateAndSnapshot(kv.persister.ReadRaftState(), snapshot)
+
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -193,8 +225,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv := new(KVServer)
 	kv.me = me
-	kv.maxraftstate = maxraftstate
 
+	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -208,7 +241,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			select {
 			case msg := <-kv.applyCh:
+				if !msg.CommandValid {
+					continue
+				}
+
 				kv.mu.Lock()
+				kv.tryPersist()
 
 				op := msg.Command.(Op)
 
