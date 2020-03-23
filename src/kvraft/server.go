@@ -193,15 +193,8 @@ func (kv *KVServer) tryPersist() {
 	// kv server state
 	e.Encode(kv.store)
 	e.Encode(kv.clientLastSeq)
-
 	snapshot := w.Bytes()
-
-	// TODO
-	// raft snapshot
-	// last included index & last included term
-
-	kv.persister.SaveStateAndSnapshot(kv.persister.ReadRaftState(), snapshot)
-
+	kv.rf.TakeSnapshot(snapshot)
 }
 
 //
