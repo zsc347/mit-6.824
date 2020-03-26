@@ -452,11 +452,15 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 		}
 
 		if index != -1 {
+			DPrintf("%d claimed to be the leader, try to submit cmd", index)
+
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+
+				DPrintf("%d claimed to be the leader, but failed to submit 1 after 2 second", index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {

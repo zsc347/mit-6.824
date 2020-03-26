@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -123,16 +123,22 @@ func (kv *KVServer) start(op *Op) (bool, *ResponseMsg, bool) {
 	if !isLeader {
 		return false, nil, false
 	}
+
+	DPrintf("--> kvserver %d handle put request with index %d", kv.me, index)
+
 	kv.mu.Lock()
 	ch := make(chan *ResponseMsg, 1)
 	kv.reponsesChan[index] = ch
 	kv.mu.Unlock()
+	DPrintf("--> kvserver %d handle put request with index %d, maked chan", kv.me, index)
 
 	select {
 	case msg := <-ch:
+		DPrintf("--> kvserver %d get response from chan for index %d", kv.me, index)
 		if msg.ClientID == op.ClientID && op.Seq == op.Seq {
 			return true, msg, false
 		}
+		DPrintf("--> kvserver %d get response from chan for index %d, but client id-seq mismatch", kv.me, index)
 		return false, nil, false
 	case <-time.After(5 * time.Second):
 		return false, nil, true
@@ -148,15 +154,23 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientID: args.ClinetID,
 		Seq:      args.Seq,
 	}
+
+	DPrintf("kvserver %d [lastClientSeq %v], handle put request %d",
+		kv.me, kv.clientLastSeq, args.Seq)
 	isLeader, _, timeout := kv.start(&op)
+
 	if !isLeader {
 		reply.WrongLeader = true
 		reply.Err = ErrApplyFailed
+		DPrintf("kvserver %d [lastClientSeq %v] handle put request %d, not leader",
+			kv.me, kv.clientLastSeq, args.Seq)
 		return
 	}
 	if timeout {
 		reply.WrongLeader = false
 		reply.Err = ErrTimeout
+		DPrintf("kvserver %d [lastClientSeq %v] handle put request %d, timeout",
+			kv.me, kv.clientLastSeq, args.Seq)
 		return
 	}
 
@@ -176,16 +190,19 @@ func (kv *KVServer) Kill() {
 }
 
 func (kv *KVServer) notifyIfPresent(index int, rsp *ResponseMsg) {
+	DPrintf("kv server %d notify msg for index %d", kv.me, index)
 	if ch, ok := kv.reponsesChan[index]; ok {
 		delete(kv.reponsesChan, index)
 		ch <- rsp
 	}
 }
 
-func (kv *KVServer) tryPersist() {
-	if kv.persister.RaftStateSize() < kv.maxraftstate {
+func (kv *KVServer) takeSnapshotIfNeed() {
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
 		return
 	}
+
+	DPrintf("kvraft server %d try take snapshot", kv.me)
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -195,6 +212,24 @@ func (kv *KVServer) tryPersist() {
 	e.Encode(kv.clientLastSeq)
 	snapshot := w.Bytes()
 	kv.rf.TakeSnapshot(snapshot)
+	DPrintf("kvraft server %d take snapshot complete", kv.me)
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var store map[string]string
+	var clientLastSeq map[int64]int64
+
+	if d.Decode(&store) != nil ||
+		d.Decode(&clientLastSeq) != nil {
+		panic("decode error")
+	}
+
+	kv.store = store
+	kv.clientLastSeq = clientLastSeq
 }
 
 //
@@ -227,20 +262,31 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.store = make(map[string]string)
 	kv.clientLastSeq = make(map[int64]int64)
 	kv.reponsesChan = make(map[int]chan *ResponseMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.shutdown = make(chan interface{})
+
+	// Deadlock here
+	// raft make need to send snapshot message to applych
+	// but apply chan not start to be listened by server yet
+	// so raft cannot return
+	// then deadlock
+
+	// solution 1
+	// listen the apply chan before raft make return
 
 	go func() {
 		for {
 			select {
 			case msg := <-kv.applyCh:
-				if !msg.CommandValid {
+
+				kv.mu.Lock()
+				if !msg.CommandValid { // currently command not valid must be a snotshot
+					kv.readSnapshot(msg.Snapshot)
+					kv.mu.Unlock()
 					continue
 				}
 
-				kv.mu.Lock()
-				kv.tryPersist()
+				DPrintf("kv server %d get chan index %d", kv.me, msg.CommandIndex)
 
+				kv.takeSnapshotIfNeed()
 				op := msg.Command.(Op)
 
 				var replyMsg *ResponseMsg
@@ -276,6 +322,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 		}
 	}()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.shutdown = make(chan interface{})
 
 	// You may need initialization code here.
 
