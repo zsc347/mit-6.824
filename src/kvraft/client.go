@@ -96,6 +96,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		reply = PutAppendReply{}
 
+		DPrintf("clerk %d send request seq %d to %d", ck.clientID, ck.seq, ck.leader)
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.Err == OK {
 			return

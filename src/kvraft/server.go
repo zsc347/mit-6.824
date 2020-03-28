@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -124,23 +124,21 @@ func (kv *KVServer) start(op *Op) (bool, *ResponseMsg, bool) {
 		return false, nil, false
 	}
 
-	DPrintf("--> kvserver %d handle put request with index %d", kv.me, index)
-
-	kv.mu.Lock()
+	kv.lock()
 	ch := make(chan *ResponseMsg, 1)
 	kv.reponsesChan[index] = ch
-	kv.mu.Unlock()
-	DPrintf("--> kvserver %d handle put request with index %d, maked chan", kv.me, index)
+	kv.unlock()
 
 	select {
 	case msg := <-ch:
-		DPrintf("--> kvserver %d get response from chan for index %d", kv.me, index)
 		if msg.ClientID == op.ClientID && op.Seq == op.Seq {
 			return true, msg, false
 		}
-		DPrintf("--> kvserver %d get response from chan for index %d, but client id-seq mismatch", kv.me, index)
 		return false, nil, false
-	case <-time.After(5 * time.Second):
+	case <-time.After(3 * time.Second):
+		kv.lock()
+		delete(kv.reponsesChan, index)
+		kv.unlock()
 		return false, nil, true
 	}
 }
@@ -155,22 +153,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Seq:      args.Seq,
 	}
 
-	DPrintf("kvserver %d [lastClientSeq %v], handle put request %d",
-		kv.me, kv.clientLastSeq, args.Seq)
 	isLeader, _, timeout := kv.start(&op)
 
 	if !isLeader {
 		reply.WrongLeader = true
 		reply.Err = ErrApplyFailed
-		DPrintf("kvserver %d [lastClientSeq %v] handle put request %d, not leader",
-			kv.me, kv.clientLastSeq, args.Seq)
 		return
 	}
 	if timeout {
 		reply.WrongLeader = false
 		reply.Err = ErrTimeout
-		DPrintf("kvserver %d [lastClientSeq %v] handle put request %d, timeout",
-			kv.me, kv.clientLastSeq, args.Seq)
 		return
 	}
 
@@ -185,34 +177,29 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 //
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
-	// Your code here, if desired.
+	DPrintf("kv server off %d", kv.me)
 	close(kv.shutdown)
 }
 
 func (kv *KVServer) notifyIfPresent(index int, rsp *ResponseMsg) {
-	DPrintf("kv server %d notify msg for index %d", kv.me, index)
 	if ch, ok := kv.reponsesChan[index]; ok {
 		delete(kv.reponsesChan, index)
 		ch <- rsp
 	}
 }
 
-func (kv *KVServer) takeSnapshotIfNeed() {
+func (kv *KVServer) takeSnapshotIfNeed(commitIndex int) {
 	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
 		return
 	}
 
-	DPrintf("kvraft server %d try take snapshot", kv.me)
-
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-
-	// kv server state
 	e.Encode(kv.store)
 	e.Encode(kv.clientLastSeq)
 	snapshot := w.Bytes()
-	kv.rf.TakeSnapshot(snapshot)
-	DPrintf("kvraft server %d take snapshot complete", kv.me)
+
+	go kv.rf.TakeSnapshot(snapshot, commitIndex)
 }
 
 func (kv *KVServer) readSnapshot(data []byte) {
@@ -230,6 +217,60 @@ func (kv *KVServer) readSnapshot(data []byte) {
 
 	kv.store = store
 	kv.clientLastSeq = clientLastSeq
+}
+
+func (kv *KVServer) lock() {
+	DPrintf("kv server %d try get lock", kv.me)
+	kv.mu.Lock()
+	DPrintf("kv server %d get lock succeed", kv.me)
+}
+
+func (kv *KVServer) unlock() {
+	DPrintf("kv server %d  release lock", kv.me)
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) apply(msg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// log.Printf("kvserver %d take msg %d", kv.me, msg.CommandIndex)
+	if !msg.CommandValid { // currently command not valid must be a snotshot
+		DPrintf("kv server %d get snapshot command", kv.me)
+		kv.readSnapshot(msg.Snapshot)
+		return
+	}
+
+	DPrintf("kv server %d get chan index %d", kv.me, msg.CommandIndex)
+	op := msg.Command.(Op)
+
+	var replyMsg *ResponseMsg
+	if op.Type == "Get" {
+		kv.clientLastSeq[op.ClientID] = op.Seq
+		v, ok := kv.store[op.Key]
+		replyMsg = &ResponseMsg{
+			ClientID:    op.ClientID,
+			Seq:         op.Seq,
+			KeyNotExist: !ok,
+			Value:       v,
+		}
+	} else {
+		if op.Seq > kv.clientLastSeq[op.ClientID] {
+			kv.clientLastSeq[op.ClientID] = op.Seq
+			if op.Type == "Put" {
+				kv.store[op.Key] = op.Value
+			} else {
+				kv.store[op.Key] += op.Value
+			}
+		}
+		replyMsg = &ResponseMsg{
+			ClientID: op.ClientID,
+			Seq:      op.Seq,
+		}
+	}
+	kv.notifyIfPresent(msg.CommandIndex, replyMsg)
+
+	kv.takeSnapshotIfNeed(msg.CommandIndex)
 }
 
 //
@@ -276,55 +317,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			select {
 			case msg := <-kv.applyCh:
-
-				kv.mu.Lock()
-				if !msg.CommandValid { // currently command not valid must be a snotshot
-					kv.readSnapshot(msg.Snapshot)
-					kv.mu.Unlock()
-					continue
-				}
-
-				DPrintf("kv server %d get chan index %d", kv.me, msg.CommandIndex)
-
-				kv.takeSnapshotIfNeed()
-				op := msg.Command.(Op)
-
-				var replyMsg *ResponseMsg
-				if op.Type == "Get" {
-					kv.clientLastSeq[op.ClientID] = op.Seq
-					v, ok := kv.store[op.Key]
-					replyMsg = &ResponseMsg{
-						ClientID:    op.ClientID,
-						Seq:         op.Seq,
-						KeyNotExist: !ok,
-						Value:       v,
-					}
-				} else {
-					if op.Seq > kv.clientLastSeq[op.ClientID] {
-						kv.clientLastSeq[op.ClientID] = op.Seq
-						if op.Type == "Put" {
-							kv.store[op.Key] = op.Value
-						} else {
-							kv.store[op.Key] += op.Value
-						}
-					}
-					replyMsg = &ResponseMsg{
-						ClientID: op.ClientID,
-						Seq:      op.Seq,
-					}
-				}
-				kv.notifyIfPresent(msg.CommandIndex, replyMsg)
-
-				kv.mu.Unlock()
+				kv.apply(&msg)
 			case <-kv.shutdown:
 				return
 			}
-
 		}
 	}()
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.shutdown = make(chan interface{})
+
+	DPrintf("kv server on %d ", kv.me)
 
 	// You may need initialization code here.
 
